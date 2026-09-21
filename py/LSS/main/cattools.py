@@ -7,7 +7,10 @@ import os
 from random import random
 
 import astropy.io.fits as fits
-from astropy.table import Table,join,unique,vstack,setdiff
+from astropy.table import Table,join,unique,vstack,hstack,setdiff
+import warnings
+from astropy.units.core import UnitsWarning
+warnings.simplefilter('ignore', category=UnitsWarning)
 
 import fitsio
 
@@ -814,8 +817,12 @@ def combQSOdata_alt(tile,zdate,coaddir='/global/cfs/cdirs/desi/spectro/redux/dai
     return qso_cat
 
 
-def combQSOdata(tile,zdate,tdate,coaddir='/global/cfs/cdirs/desi/spectro/redux/daily/tiles/archive/',cols=None ):
-    from LSS.qso_cat_utils import qso_catalog_maker
+def combQSOdata(tile,zdate,tdate,coaddir='/global/cfs/cdirs/desi/spectro/redux/daily/tiles/archive/',cols=None,qso_maker='desispec' ):
+    #import LSS.common_tools as common
+    if qso_maker == 'orig':
+        from LSS.qso_cat_utils import qso_catalog_maker
+    if qso_maker == 'desispec':
+        from LSS.common_tools import desispec_validate as qso_catalog_maker
     #put data from different spectrographs together, one table for fibermap, other for z
     zdate = str(zdate)
     specs = []
@@ -867,7 +874,40 @@ def combQSOdata(tile,zdate,tdate,coaddir='/global/cfs/cdirs/desi/spectro/redux/d
         qn = coaddir+str(tile)+'/'+zdate+'/'+'qso_qn'+'-'+str(specs[i])+'-'+str(tile)+'-thru'+tdate+'.fits'
         old_extname_redrock = True if zhdu == 'ZBEST' else False
         old_extname_for_qn = False #if int(tdate) >= 20220118 else True
-        qso_cati = Table.from_pandas(qso_catalog_maker(rr, mgii, qn, old_extname_redrock, old_extname_for_qn, update_qn_zwarn = False))
+        if qso_maker == 'orig':
+            qso_cati = Table.from_pandas(qso_catalog_maker(rr, mgii, qn, old_extname_redrock, old_extname_for_qn, update_qn_zwarn = False))
+        if qso_maker == 'desispec':
+            rrd = Table(fitsio.read(rr,ext=zhdu))
+            rrfm = Table(fitsio.read(rr,ext='FIBERMAP'))
+            rrfm.remove_columns(['TARGETID','DESI_TARGET'])
+            rrtsnr = Table(fitsio.read(rr,ext='TSNR2'))
+            rrtsnr.remove_columns(['TARGETID'])
+            #print(rrd.dtype.names)
+            #print(rr)
+            #print(rrfm.dtype.names)
+            mgiid = Table(fitsio.read(mgii))
+            mgiid.remove_columns(['TARGETID','SPECTYPE','ZERR'])
+            mgiid.rename_column('DELTA_CHI2','DELTA_CHI2_MGII')
+            mgiid.rename_column('VAR_A','VAR_A_MGII')
+            mgiid.rename_column('VAR_B','VAR_B_MGII')
+            mgiid.rename_column('A','A_MGII')
+            mgiid.rename_column('B','B_MGII')
+
+            mgiid.rename_column('SIGMA','SIGMA_MGII')
+            mgiid.rename_column('VAR_SIGMA','VAR_SIGMA_MGII')
+            #print(mgiid.dtype.names)
+            qnd = Table(fitsio.read(qn))
+            qnd.keep_columns(['SPECTYPE_RR', 'IS_QSO_QN_NEW_RR', 'Z_QN', 'C_LYA', 'C_CIV', 'C_CIII', 'C_MgII', 'C_Hbeta', 'C_Halpha', 'Z_LYA', 'Z_CIV', 'Z_CIII', 'Z_MgII', 'Z_Hbeta', 'Z_Halpha', 'Z_NEW', 'ZERR_NEW', 'ZWARN_NEW', 'SPECTYPE_NEW', 'SUBTYPE_NEW', 'CHI2_NEW', 'DELTACHI2_NEW', 'COEFF_NEW'])
+            #print(qnd.dtype.names)
+            cat = hstack([rrd,rrfm,rrtsnr,mgiid,qnd])
+            #print(cat.dtype.names)
+            cat_val = qso_catalog_maker(cat,ignore_emline=True)
+            cat['Z_QSO'] = cat_val['Z_QSO']
+            cat['QSO_MASKBITS'] = cat_val['QSO_MASKBITS']
+            selqso = cat_val['GOOD_Z_LYA']
+            qso_cati = cat[selqso]
+            qso_cati['Z'] = qso_cati['Z_QSO']
+            
         #qso_cati = Table(qso_catalog_maker(rr, mgii, qn, old_extname_redrock, old_extname_for_qn))
         qsocats.append(qso_cati)
         #if i == 0:
@@ -1126,13 +1166,15 @@ def get_tiletab(tile_row,tarcol=['RA','DEC','TARGETID','DESI_TARGET','BGS_TARGET
     #wt = tiles['TILEID'] == tile
     #print('reading targets for tile '+ts+' from '+mdir)
     tars = read_targets_in_tiles(mdir,tile_row,mtl=True,isodate=fht['MTLTIME'])
+    tars = tars[[b for b in tarcol]] # do this here before combining with mtl2
     if 'MTL2' in fht.keys():
         mdir = '/dvs_ro/cfs/cdirs/desi'+fht['MTL2'][8:]+'/'
         #print('reading targets for tile '+ts+' from '+mdir)
         tars2 = read_targets_in_tiles(mdir,tile_row,mtl=True,isodate=fht['MTLTIME'])
+        tars2 = tars2[[b for b in tarcol]] #do this here to match ordering before concatenating
         tars = np.concatenate([tars,tars2])
     #tars.keep_columns(tarcols)
-    tars = tars[[b for b in tarcol]]
+    
 
     tt = Table.read(faf,hdu='POTENTIAL_ASSIGNMENTS')
     tars = join(tars,tt,keys=['TARGETID'])
@@ -2332,22 +2374,27 @@ def combran(tiles,rann,randir,ddir,tp,tmask,tc='SV3_DESI_TARGET',imask=False):
 
     fu.write(randir+str(rann)+'/rancomb_'+tp+'_Alltiles.fits',format='fits', overwrite=True)
 
-def mkfullran_prog(gtl,indir,rann,imbits,outf,pd,tlid_full=None,badfib=None,ftiles=None):
+def mkfullran_prog(gtl,indir,rann,imbits,outf,pd,mode1b=0,tlid_full=None,badfib=None,ftiles=None,dr11=False):
     import LSS.common_tools as common
     #import logging
     logger = logging.getLogger('LSSran')
-
-
-
+        
     zf = indir.replace('global','dvs_ro')+'/rancomb_'+str(rann)+pd+'wdupspec_zdone.fits'
     logger.info('about to load '+zf)
     in_cols = ['LOCATION', 'FIBER', 'TARGETID', 'RA', 'DEC', 'TILEID', 'PRIORITY']#, 'TILELOCID']
     dz = Table(fitsio.read(zf,columns=in_cols))
+    if mode1b == 2:
+        zf = indir.replace('global','dvs_ro')+'/rancomb_'+str(rann)+pd+'1bwdupspec_zdone.fits'
+        logger.info('about to load '+zf)
+        in_cols = ['LOCATION', 'FIBER', 'TARGETID', 'RA', 'DEC', 'TILEID', 'PRIORITY']#, 'TILELOCID']
+        dz = vstack([dz,Table(fitsio.read(zf,columns=in_cols))])
+        
     logger.info(dz.dtype.names)
 
     cols = list(dz.dtype.names)
  
 
+    
     dz['TILELOCID'] = 10000*dz['TILEID'] +dz['LOCATION'] #reset it here in case was set by specdat and some matches were missing
 
     wg = np.isin(dz['TILELOCID'],gtl)
@@ -2393,10 +2440,25 @@ def mkfullran_prog(gtl,indir,rann,imbits,outf,pd,tlid_full=None,badfib=None,ftil
     if len(imbits) > 0:
         logger.info(str(rann)+' joining with original randoms to get mask properties')
         dirrt='/dvs_ro/cfs/cdirs/desi/target/catalogs/dr9/0.49.0/randoms/resolve/'
+        dir11='/dvs_ro/cfs/cdirs/desi/target/catalogs/dr11/5.1.0/randoms/resolve/'
         tcol = ['TARGETID','MASKBITS','PHOTSYS','NOBS_G','NOBS_R','NOBS_Z'] #only including what are necessary for mask cuts for now
         #tcol = ['TARGETID','EBV','WISEMASK_W1','WISEMASK_W2','BRICKID','PSFDEPTH_G','PSFDEPTH_R','PSFDEPTH_Z','GALDEPTH_G',\
         #'GALDEPTH_R','GALDEPTH_Z','PSFDEPTH_W1','PSFDEPTH_W2','PSFSIZE_G','PSFSIZE_R','PSFSIZE_Z','MASKBITS','PHOTSYS','NOBS_G','NOBS_R','NOBS_Z']
-        tarf = fitsio.read(dirrt+'/randoms-1-'+str(rann)+'.fits',columns=tcol)
+        
+        if dr11:
+            tarf = fitsio.read(dirrt+'/randoms-1-'+str(rann)+'.fits',columns=tcol+['RA','DEC'])
+            logger.info('adding in DR11 target info and cutting to dr9/dr11')
+            sel11 = common.select_DR11(tarf)
+            tarf = tarf[~sel11]
+            tarf11 = fitsio.read(dir11+'/randoms-1-'+str(rann)+'.fits',columns=tcol+['RA','DEC'])
+            sel11 = common.select_DR11(tarf11)
+            tarf11 = tarf11[sel11]
+            tarf = np.concatenate([tarf,tarf11])
+            tarf = Table(tarf)
+            tarf.remove_columns(['RA','DEC'])
+            del tarf11
+        else:
+            tarf = fitsio.read(dirrt+'/randoms-1-'+str(rann)+'.fits',columns=tcol)
         dz = join(dz,tarf,keys=['TARGETID'])
         logger.info(str(rann)+' completed join with original randoms to get mask properties')
         del tarf
@@ -3121,7 +3183,7 @@ def mkfulldat_mock(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumu
     common.write_LSS_scratchcp(dz,outf,logger=logger)
     #common.write_LSS(dz,outf)
 
-def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',emlin_fn=None,desitarg='DESI_TARGET',survey='Y1',specver='daily',notqso='',qsobit=4,min_tsnr2=0,badfib=None,badfib_status=None,gtl_all=None,mockz=None, mask_coll=False,logger=None, mocknum=None, mockassigndir=None,return_array='n',calc_ctile='y'):
+def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,mode1b=0,maxp=3400,azf='',azfm='cumul',emlin_fn=None,desitarg='DESI_TARGET',survey='Y1',specver='daily',notqso='',qsobit=4,min_tsnr2=0,badfib=None,badfib_status=None,gtl_all=None,mockz=None, mask_coll=False,logger=None, mocknum=None, mockassigndir=None,return_array='n',calc_ctile='y'):
     import LSS.common_tools as common
     """Make 'full' data catalog, contains all targets that were reachable, with columns denoted various vetos to apply
     ----------
@@ -3136,6 +3198,7 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
         argument.
     outf : :class:`str`, path to write output to
     ftiles : :class:`str`, path to file containing information on how and where each target
+    mode1b : :`int`, 0 (no 1b), 1 (1b only), or 2 (combine 1b with no 1b)
     azf : :class:`str`, path to where to find extra redshift info for ELG/QSO catalogs
     azfm : :class:`str`, whether to use per tile ('cumul') or healpix redshifts ('hp')
     desitarg : :class:`str`, column to use when selecting on targeting bit
@@ -3150,7 +3213,7 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
     Notes
     -----
     """
-
+    logger.info('using updated function')
     if emlin_fn is None:
         logger.info('will not be adding emline info, because emlin_fn is None')
     else:
@@ -3161,6 +3224,7 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
         tscol = 'TSNR2_BGS'
         #CHANGE TO HANDLE MOCK PATHS PROPERLY
         collf = '/dvs_ro/cfs/cdirs/desi/survey/catalogs/'+survey+'/LSS/collisions-BRIGHT.fits'
+        collf1b = '/dvs_ro/cfs/cdirs/desi/survey/catalogs/'+survey+'/LSS/collisions-BRIGHT1B.fits'
     elif tp[:3] == 'LGE':
         pd = 'dark1b'
         tscol = 'TSNR2_ELG'
@@ -3169,15 +3233,35 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
         pd = 'dark'
         tscol = 'TSNR2_ELG'
         collf = '/dvs_ro/cfs/cdirs/desi/survey/catalogs/'+survey+'/LSS/collisions-DARK.fits'
-
+        collf1b = '/dvs_ro/cfs/cdirs/desi/survey/catalogs/'+survey+'/LSS/collisions-DARK1B.fits'
     
     if mockz and mask_coll:
         collf = mask_coll
 
+    logger.info('getting input repeat targets data in mode1b '+str(mode1b))
     if '.fits' in zf:
-        dz = Table(fitsio.read(zf))
+        zfno1b = zf.strip('.fits')+'_zdone.fits'#+f1b+'_zdone.fits'
+        zf1b = zf.strip('.fits')+'_1b_zdone.fits'
+
+        if mode1b == 0 or mode1b == 2:
+            dz = Table(fitsio.read(zfno1b))
+        if mode1b == 1:
+            dz = Table(fitsio.read(zf1b))
+        if mode1b == 2:
+            dz1b = Table(fitsio.read(zf1b))
+            logger.info('read 1b and non 1b')
+            dz = vstack([dz,dz1b])        
+            del dz1b
     if '.h5' in zf:
-        dz = common.read_hdf5_blosc(zf)
+        zfno1b = zf
+        if mode1b == 0 or mode1b == 2:
+            dz = common.read_hdf5_blosc(zfno1b)
+        if mode1b == 1:
+            dz = common.read_hdf5_blosc(zf1b)  
+        if mode1b == 2:
+            dz = vstack([dz,common.read_hdf5_blosc(zf1b)])        
+
+    logger.info('length of input repeat targets data is '+str(len(dz)))
     wtype = ((dz[desitarg] & bit) > 0)
     if notqso == 'notqso':
         if logger is not None:
@@ -3187,13 +3271,17 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
         wtype &= ((dz[desitarg] & qsobit) == 0)
 
     if logger is not None:
-        logger.info('length before cut is '+str(len(dz))+', length of input cut after to type is '+str(len(dz[wtype])))
+        logger.info('length of input cut after to type is '+str(len(dz[wtype])))
     else:
         print(len(dz[wtype]))
     dz = dz[wtype]
 
     if mask_coll:
         coll = Table(fitsio.read(collf))
+        if mode1b == 2:
+            coll1b = Table(fitsio.read(collf1b))
+            coll = vstack([coll,coll1b])
+            del coll1b
         if logger is not None:
             logger.info('length before masking collisions '+str(len(dz)))
         else:
@@ -3211,8 +3299,10 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
     #changing behavior back, load file that is spec info including zmtl
     specdir = '/global/cfs/cdirs/desi/survey/catalogs/'+survey+'/LSS/'+specver+'/'
     prog = 'dark'
+    prog1b = 'dark1b'
     if tp[:3] == 'BGS':
         prog = 'bright'
+        prog1b = 'bright1b'
     if 'LGE' in tp:
         prog = 'dark1b'
 
@@ -3227,14 +3317,23 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
             common.printlog('reading '+assignf+'.fits',logger)
             fs = fitsio.read(assignf.replace('global', 'dvs_ro'))
             fs = Table(fs)
+        else:
+            common.printlog(fs +' not found!',logger)
         fs['TILELOCID'] = 10000*fs['TILEID'] +fs['LOCATION']
     else:
         specf = specdir+'datcomb_'+prog+'_spec_zdone.fits'
+        specf1b = specdir+'datcomb_'+prog1b+'_spec_zdone.fits'
         if logger is not None:
             logger.info('reading from spec file '+specf)
         else:
             print(specf)
         fs = fitsio.read(specf)
+        if mode1b == 2:
+            logger.info('adding 1b spec info')
+            fs1b = fitsio.read(specf1b)
+            fs1b = fs1b[[b for b in list(fs.dtype.names)]] #need same columns in same order before concatenating
+            fs = np.concatenate([fs,fs1b])
+            del fs1b
         #common.printlog('badfib type is '+str(type(badfib).__name__),logger)
         #common.printlog('badfib type row 0 '+str(type(badfib[0]).__name__),logger)
         if specver == 'daily':
@@ -3394,21 +3493,37 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
         for col in remcol:
             if col in cols:
                 dz.remove_columns([col]) #these come back in with merge to full target file
+        ndatpretar = len(dz)
         dz = join(dz,ftar,keys=['TARGETID'])
+        if ndatpretar != len(dz):
+            common.printlog('lost '+str(ndatpretar-len(dz))+' targets after join, should be from dr9->dr11',logger)
+        else:
+            common.printlog('did not lose any targets during join',logger)
     
     if specver == 'daily':
         spec_cols = ['TARGETID','TILEID','LOCATION','Z','ZERR','SPECTYPE','DELTACHI2'\
         ,'COADD_FIBERSTATUS','FIBERASSIGN_X','FIBERASSIGN_Y','COADD_NUMEXP','COADD_EXPTIME','COADD_NUMNIGHT'\
         ,'MEAN_DELTA_X','MEAN_DELTA_Y','RMS_DELTA_X','RMS_DELTA_Y','MEAN_PSF_TO_FIBER_SPECFLUX']
-        dailydir = '/global/cfs/cdirs/desi/survey/catalogs/main/LSS/daily/'
+        dailydir = '/dvs_ro/cfs/cdirs/desi/survey/catalogs/main/LSS/daily/'
+        common.printlog('adding info from spec file '+dailydir+'datcomb_'+prog+'_spec_zdone.fits',logger)
+        common.printlog('mode1b is '+str(mode1b),logger)
         prog = 'dark'
         if tp[:3] == 'BGS':
             prog = 'bright'
         if tp == 'LGE':
             prog = 'dark1b'
         specdat = fitsio.read(dailydir+'datcomb_'+prog+'_spec_zdone.fits',columns=spec_cols)
+        if mode1b == 2:
+            common.printlog('adding 1b spec info',logger)
+            fs1b = fitsio.read(specf1b,columns=spec_cols)
+            fs1b = fs1b[[b for b in list(specdat.dtype.names)]] #need same columns in same order before concatenating
+            specdat = np.concatenate([specdat,fs1b])
+            del fs1b
+        else:
+            common.printlog('did not add 1b because mode1b is '+str(mode1b),logger)
         dz = join(dz,specdat,keys=['TARGETID','TILEID','LOCATION'],join_type='left')
-    
+        logger.info('joined specdat')
+        del specdat
     if len(imbits) > 0:
         dz = common.cutphotmask(dz,imbits,logger=logger)
         if logger is not None:
@@ -3419,7 +3534,7 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
 
     if tp[:3] == 'ELG' and azf != '' and azfm == 'cumul':# or tp == 'ELG_HIP':
         if azf is not None and 'OII_FLUX' not in list(dz.dtype.names):
-            arz = Table(fitsio.read(azf,columns=['TARGETID','LOCATION','TILEID','OII_FLUX','OII_FLUX_IVAR']))
+            arz = Table(fitsio.read(azf.replace('global','dvs_ro'),columns=['TARGETID','LOCATION','TILEID','OII_FLUX','OII_FLUX_IVAR']))
             arz['TILEID'] = arz['TILEID'].astype(int)
             dz = join(dz,arz,keys=['TARGETID','LOCATION','TILEID'],join_type='left')#,uniq_col_name='{col_name}{table_name}',table_names=['', '_OII'])
         o2c = np.log10(dz['OII_FLUX'] * np.sqrt(dz['OII_FLUX_IVAR']))+0.2*np.log10(dz['DELTACHI2'])
@@ -3436,7 +3551,7 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
         logger.info('adding extra redshift info to QSO with '+azf)
         if emlin_fn is None:
             logger.info('will not be adding emline info, because emlin_fn is None')
-        arz = Table(fitsio.read(azf))
+        arz = Table(fitsio.read(azf.replace('global','dvs_ro')))
         arz.keep_columns(['TARGETID','LOCATION','TILEID','Z','Z_QN'])
         arz['TILEID'] = arz['TILEID'].astype(int)
         #print(arz.dtype.names)
@@ -3452,7 +3567,7 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,maxp=3400,azf='',azfm='cumul',em
                     cols.append(col)
             logger.info('columns to use for match are '+str(cols))
             if len(cols) > 3:
-                emcat =  Table(fitsio.read(emlin_fn,columns=cols))
+                emcat =  Table(fitsio.read(emlin_fn.replace('global','dvs_ro'),columns=cols))
                 emcat['TILEID'] = emcat['TILEID'].astype(int)
                 dz = join(dz,emcat,keys=['TARGETID','LOCATION','TILEID'],join_type='left')
 
@@ -3668,8 +3783,8 @@ def add_zfail_weight2fullQSO(indir,version,qsocat,tsnrcut=80,readpars=False,logg
     needed_cols = ['OII_FLUX','OII_FLUX_IVAR','OIII_FLUX','OIII_FLUX_IVAR']
     em_cols = ['TARGETID','LOCATION','TILEID']
     for col in needed_cols:
-    	if col not in list(ff.dtype.names):
-    	    em_cols.append(col)
+        if col not in list(ff.dtype.names):
+            em_cols.append(col)
     if len(em_cols) > 3:
         common.printlog('adding info from emline file',logger)
         em_fn = indir + 'emlin_catalog.fits'
@@ -3961,7 +4076,7 @@ def add_zfail_weight2full(indir,tp='',tsnrcut=80,readpars=False,hpmapcut='_HPmap
 
 
 
-def mkclusdat(fl,weighttileloc=True,zmask=False,correct_zcmb='n',tp='',dchi2=9,rcut=None,ntilecut=0,ccut=None,ebits=None,zmin=0,zmax=6,write_cat='y',splitNS='n',return_cat='n',compmd='ran',kemd='',wsyscol=None,use_map_veto='',subfrac=1,zsplit=None, ismock=False,logger=None,extradir='', extracols=None,exttp='.fits'):
+def mkclusdat(fl,redo_fracz=False,NN=False,weighttileloc=True,zmask=False,correct_zcmb='n',tp='',dchi2=9,rcut=None,ntilecut=0,ccut=None,ebits=None,zmin=0,zmax=6,write_cat='y',splitNS='n',return_cat='n',compmd='ran',kemd='',wsyscol=None,use_map_veto='',subfrac=1,zsplit=None, ismock=False,logger=None,extradir='', extracols=None,exttp='.fits'):
     import LSS.common_tools as common
     from LSS import ssr_tools
     '''
@@ -3996,7 +4111,11 @@ def mkclusdat(fl,weighttileloc=True,zmask=False,correct_zcmb='n',tp='',dchi2=9,r
     elif os.path.isfile(in_fn+'.fits'):
         common.printlog('reading '+in_fn+'.fits',logger)
         ff = Table.read(in_fn.replace('global', 'dvs_ro')+'.fits')
-
+    else:
+        common.printlog('did not find file associated with '+in_fn)
+    if redo_fracz and 'NEW_WEIGHTFRACZ' not in list(ff.dtype.names):
+        ff['NEW_WEIGHTFRACZ'] = common.get_fracz_pNNweight(ff, get_nnweight=NN,logger=logger)
+        
     #ff = Table.read(fl+'_full'+use_map_veto+'.dat.fits'.replace('global','dvs_ro'))
     if wsyscol is not None:
         ff['WEIGHT_SYS'] = np.copy(ff[wsyscol])
@@ -4142,8 +4261,11 @@ def mkclusdat(fl,weighttileloc=True,zmask=False,correct_zcmb='n',tp='',dchi2=9,r
     #    ff['WEIGHT_ZFAIL'] = 1./ff['relSSR_tile']
     
     if weighttileloc == True:
-        ff['WEIGHT_COMP'] = 1./ff['FRACZ_TILELOCID']
-        if 'FRAC_TLOBS_TILES' in cols and compmd == 'dat':
+        if  redo_fracz:
+            ff['WEIGHT_COMP'] = ff['NEW_WEIGHTFRACZ']
+        else:
+            ff['WEIGHT_COMP'] = 1./ff['FRACZ_TILELOCID']
+        if 'FRAC_TLOBS_TILES' in cols and compmd == 'dat' and NN == False:
             ff['WEIGHT_COMP'] *= 1/ff['FRAC_TLOBS_TILES']
 
         ff['WEIGHT'] *= ff['WEIGHT_COMP']
@@ -4970,7 +5092,7 @@ def randomtiles_allmain(tiles,dirout='/global/cfs/cdirs/desi/survey/catalogs/mai
                 rmtl.write(fname,format='fits', overwrite=True)
                 print('added columns, wrote to '+fname)
 
-def randomtiles_allmain_pix_2step(tiles,dirout='/global/cfs/cdirs/desi/survey/catalogs/main/LSS/random',ii=0,dirrt='/global/cfs/cdirs/desi/target/catalogs/dr9/0.49.0/randoms/resolve/',logger=None ):
+def randomtiles_allmain_pix_2step(tiles,dirout='/global/cfs/cdirs/desi/survey/catalogs/main/LSS/random',ii=0,randir11 = '/dvs_ro/cfs/cdirs/desi/target/catalogs/dr11/5.4.0/randoms/resolve/',dirrt='/global/cfs/cdirs/desi/target/catalogs/dr9/2.4.0/randoms/resolve/',ranind=1,logger=None ):
     '''
     tiles should be a table containing the relevant info
     '''
@@ -4978,7 +5100,6 @@ def randomtiles_allmain_pix_2step(tiles,dirout='/global/cfs/cdirs/desi/survey/ca
     import desimodel.focalplane
     import desimodel.footprint
     import LSS.common_tools as common
-    common.printlog('making random target files for tiles',logger)
     trad = desimodel.focalplane.get_tile_radius_deg()*1.1 #make 10% greater just in case
     #print(trad)
 
@@ -4998,10 +5119,28 @@ def randomtiles_allmain_pix_2step(tiles,dirout='/global/cfs/cdirs/desi/survey/ca
     if len(tiles) == 0:
         common.printlog('no tiles to process for '+str(ii),logger)
         return True
-    rtall = read_targets_in_tiles(dirrt,tiles)
-    common.printlog('read targets on all tiles',logger)
-
-    common.printlog('creating files for '+str(len(tiles))+' tiles',logger)
+    common.printlog('making random target files '+str(ii)+' for '+str(len(tiles))+' tiles',logger)
+    rtall = read_targets_in_tiles(dirrt+'randoms-'+str(ranind)+'-'+str(ii),tiles)
+    common.printlog('read dr9 targets on all tiles',logger)
+    rt11 = read_targets_in_tiles(randir11+'randoms-'+str(ranind)+'-'+str(ii),tiles)
+    common.printlog('read dr11 targets on all tiles',logger)
+    if len(rt11) > 0:
+        sbricks = fitsio.read('/dvs_ro/cfs/cdirs/desi/survey/ops/surveyops/trunk/mtl/survey-bricks-dr.fits')
+        sel9 = sbricks['DRVERSION'] == 9
+        sel11 = sbricks['DRVERSION'] == 11
+        dr9_bricks = sbricks['BRICKID'][sel9]
+        dr11_bricks = sbricks['BRICKID'][sel11]
+        dr9in = np.isin(rtall['BRICKID'],dr9_bricks)
+        rtall = rtall[dr9in]
+        dr11in = np.isin(rt11['BRICKID'],dr11_bricks)
+        rt11 = rt11[dr11in]
+        #rt11.keep_columns('RA','DEC','TARGETID')
+        #rtall.keep_columns('RA','DEC','TARGETID')
+        rt11 = rt11[[b for b in list(rtall.dtype.names)]]
+        rtall = np.concatenate([rtall,rt11])
+        del rt11
+        
+    common.printlog('Loaded targets, now creating files per tile for '+str(ii),logger)
     #for i in range(0,len(tiles)):
     def _create_rantile(ind):
         fname = dirout+str(ii)+'/tilenofa-'+str(tiles['TILEID'][ind])+'.fits'
@@ -5026,7 +5165,8 @@ def randomtiles_allmain_pix_2step(tiles,dirout='/global/cfs/cdirs/desi/survey/ca
         rmtl['OBSCONDITIONS'] = np.ones(len(rmtl),dtype=int)*516#tiles['OBSCONDITIONS'][i]
         rmtl['SUBPRIORITY'] = np.random.random(len(rmtl))
         #print('added columns for '+fname)
-        rmtl.write(fname,format='fits', overwrite=True)
+        common.write_LSS_scratchcp(rmtl,fname,logger=logger)
+        #rmtl.write(fname,format='fits', overwrite=True)
         del rmtl
         common.printlog('added columns, wrote to '+fname,logger)
         #nd += 1

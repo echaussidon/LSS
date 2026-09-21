@@ -68,6 +68,8 @@ parser.add_argument("--survey", help="e.g., main (for all), DA02, any future DA"
 parser.add_argument("--verspec",help="version for redshifts",default='loa-v1')
 parser.add_argument("--redotar", help="remake the target file for the particular type (needed if, e.g., the requested columns are changed)",default='n')
 parser.add_argument("--fulld", help="make the 'full' catalog containing info on everything physically reachable by a fiber",default='n')
+parser.add_argument("--mode1b", help="integer to encode what to do with 1b data, see code block for explanation of default behavior",default=None)
+
 parser.add_argument("--add_veto", help="add veto column for given type, matching to targets",default='n')
 parser.add_argument("--join_etar", help="whether or not to join to the target files with extra brick pixel info",default='n')
 parser.add_argument("--apply_veto", help="apply vetos for imaging, priorities, and hardware failures",default='n')
@@ -132,6 +134,8 @@ parser.add_argument("--imsys_colname",help="column name for fiducial imaging sys
 parser.add_argument("--add_weight_zfail",help="add weights for redshift systematics to full file?",default='n')
 parser.add_argument("--add_bitweight",help="add info from the alt mtl",default='n')
 parser.add_argument("--compmd",help="use altmtl to use PROB_OBS",default='not_altmtl')
+parser.add_argument("--redo_fracz",help="whether to recalculate the completeness weights based on masked data",default='n')
+parser.add_argument("--nearestneighbor",help="whether to nearest neighbor weights on data instead of frac_tl_obs on randoms",default='n')
 parser.add_argument("--addNtileweight2full",help="whether to add the NTILE weight to the full catalogs (necessary for consistent angular upweighting)",default='n')
 parser.add_argument("--NStoGC",help="convert to NGC/SGC catalogs",default='n')
 parser.add_argument("--splitGC",help="convert to NGC/SGC catalogs",default='n')
@@ -318,11 +322,45 @@ if mktar: #concatenate target files for given type, with column selection hardco
     import LSS.imaging.select_samples as ss
     ss.gather_targets(type,tardir,tarf,tarver,'main',progl,keys=keys)
 
+tarver_dr11 = '5.2.0'
+tardir11 = '/global/cfs/cdirs/desi/target/catalogs/dr11/'+tarver_dr11+'/targets/main/resolve/'
+tarf11 = '/global/cfs/cdirs/desi/survey/catalogs/main/LSS/'+type +'targetsDR11v'+tarver_dr11.strip('.')+'.fits'
+mktar11 = True
+if os.path.isfile(tarf11) and redotar == False or len(type.split('-'))>1:    
+    mktar11 = False
+if mktar11: #concatenate target files for given type, with column selection hardcoded
+    import LSS.imaging.select_samples as ss
+    ss.gather_targets(type,tardir11,tarf11,tarver_dr11,'main',progl,keys=keys)
+
+if args.survey == 'main':
+    tarfc = '/global/cfs/cdirs/desi/survey/catalogs/main/LSS/'+type +'targetsDR9p11.fits'
+    if not os.path.isfile(tarfc):
+        sbricks = fitsio.read('/global/cfs/cdirs/desi/survey/ops/surveyops/trunk/mtl/survey-bricks-dr.fits')
+        t9 = fitsio.read(tarf)
+        if 'lrg_mask' in list(t9.dtype.names):
+            t9 = Table(t9)
+            t9.remove_column('lrg_mask') #this is recorded in a separate file
+        t11 = fitsio.read(tarf11)
+        sel9 = sbricks['DRVERSION'] == 9
+        sel11 = sbricks['DRVERSION'] == 11
+        dr9_bricks = sbricks['BRICKID'][sel9]
+        dr9in = np.isin(t9['BRICKID'],dr9_bricks)
+        dr11_bricks = sbricks['BRICKID'][sel11]
+        dr11in = np.isin(t11['BRICKID'],dr11_bricks)
+        
+        tc = np.concatenate([t9[dr9in],t11[dr11in]])
+        del t9
+        del t11
+        common.write_LSS_scratchcp(tc,tarfc,logger=logger)
+        del tc
+else:
+    tarfc = tarf
+
 mketar = False
 etardir = '/global/cfs/cdirs/desi/survey/catalogs/extra_target_data/'+tarver+'/'
 etarf = maindir+type +'targets_pixelDR9v'+tarver.strip('.')+'.fits'        
 if os.path.isfile(etarf) and redotar == False: 
-    common.printlog('making '+tarf,logger)
+    #common.printlog('making '+tarf,logger)
     mketar = False
 
 if args.survey != 'main':
@@ -341,7 +379,16 @@ if type[:3] == 'LRG' or notqso == 'notqso':
 if type[:3] == 'LGE':
     maxp = 3210
 if type[:3] == 'BGS':
+
     maxp = 2100
+if args.mode1b is None:
+    mode1b = 0 #default is to not use 1b
+    if args.survey == 'main':
+        mode1b = 2 #will combine 1b with not 1b
+        if type == 'LGE':
+            mode1b = 1 #only use 1b for LGE
+else:
+    mode1b = int(args.mode1b)
 
        
 if mkfulld:
@@ -371,11 +418,11 @@ if mkfulld:
             tracer_ts = 'ELG'
         if type[:3] == 'BGS':
             tracer_ts = 'BGS_ANY'
-        f1b = ''
-        if type[:3] == 'LGE' and args.survey != 'main':
-            f1b = '_1b'
+        #f1b = ''
+        #if type[:3] == 'LGE':
+        #    f1b = '_1b'
 
-        dz = ldirspec+'datcomb_'+tracer_ts+'_tarspecwdup'+f1b+'_zdone.fits'
+        dz = ldirspec+'datcomb_'+tracer_ts+'_tarspecwdup.fits'#leaving .fits to encode whether .fits or h5;+f1b+'_zdone.fits'
         tlf = None
         if type[:3] == 'ELG':
             azf = emlin_fn
@@ -385,21 +432,21 @@ if mkfulld:
     #    tlf = ldirspec+type+'_tilelocs.dat.fits'
 
  
-    ftar = fitsio.read(tarf)   
+    ftar = fitsio.read(tarfc)   
 
     from desitarget import targetmask
     if type == 'BGS_BRIGHT' or type == 'BGS_FAINT':
-        bit = targetmask.bgs_mask[type]
+        bit = targetmask.bgs_mask[type] # BGS_ANY does not have a bgs_mask
         desitarg='BGS_TARGET'
     else:
-        bit = targetmask.desi_mask[type]
+        bit = targetmask.desi_mask[type] # BGS_ANY should be handled correctly here
         desitarg='DESI_TARGET'
     
     maskcoll = False
     if args.survey != 'main':
         maskcoll = True
     common.printlog('the emline file is '+emlin_fn)
-    ct.mkfulldat(dz,imbits,ftar,type,bit,dirout+type+notqso+'_full_noveto.dat.fits',tlf,emlin_fn=emlin_fn,survey=args.survey,maxp=maxp,azf=azf,azfm=azfm,desitarg=desitarg,specver=specrel,notqso=notqso,min_tsnr2=tsnrcut,badfib=mainp.badfib_td,badfib_status=mainp.badfib_status,mask_coll=maskcoll,logger=logger)
+    ct.mkfulldat(dz,imbits,ftar,type,bit,dirout+type+notqso+'_full_noveto.dat.fits',tlf,mode1b=mode1b,emlin_fn=emlin_fn,survey=args.survey,maxp=maxp,azf=azf,azfm=azfm,desitarg=desitarg,specver=specrel,notqso=notqso,min_tsnr2=tsnrcut,badfib=mainp.badfib_td,badfib_status=mainp.badfib_status,mask_coll=maskcoll,logger=logger)
 
 
 if args.add_veto == 'y':
@@ -410,10 +457,15 @@ if args.add_veto == 'y':
     if type == 'LGE':
         mask_type = 'lrg'
         tarver='targetsDR9v3.0.0'
-    common.add_veto_col(fin,type,ran=False,tracer_mask=mask_type,redo=True,tarver=tarver)#,rann=0
+    dr11=False
+    if args.survey == 'main':
+        dr11 = True
+    common.add_veto_col(fin,type,ran=False,tracer_mask=mask_type,dr11=dr11,redo=True,tarver=tarver)#,rann=0
     for rn in range(rm,rx):
         fin = dirout+progl+'_'+str(rn)+'_full_noveto.ran.fits'
-        common.add_veto_col(fin,type,ran=True,tracer_mask=mask_type,rann=rn,tarver=tarver)
+        if mode1b == 2:
+            fin = dirout+progl+'p1b_'+str(rn)+'_full_noveto.ran.fits'
+        common.add_veto_col(fin,type,ran=True,tracer_mask=mask_type,rann=rn,tarver=tarver,dr11=dr11)
         
 if args.join_etar == 'y':
     logf.write('added extra target columns to data catalogs for '+tp+' '+str(datetime.now()))
@@ -446,6 +498,8 @@ if args.apply_veto == 'y':
     def _parfun(rn):
         #fin = dirout.replace('global','dvs_ro')+type+notqso+'_'+str(rn)+'_full_noveto.ran.fits'
         fin = dirout.replace('global','dvs_ro')+progl+'_'+str(rn)+'_full_noveto.ran.fits'
+        if mode1b == 2:
+            fin = dirout.replace('global','dvs_ro')+progl+'p1b_'+str(rn)+'_full_noveto.ran.fits'
         fout = dirout+type+notqso+'_'+str(rn)+'_full.ran.fits'
         common.apply_veto(fin,fout,ebits=ebits,zmask=False,maxp=maxp,reccircmasks=mainp.reccircmasks,logger=logger)
         print('random veto '+str(rn)+' done')
@@ -878,10 +932,10 @@ if args.prepsysnet == 'y' or args.regressis == 'y' or args.imsys == 'y' or args.
 #del ran
 
 #for i in range(1,4):
-#	ranf = '/global/cfs/cdirs/desi/survey/catalogs//DA2/LSS/loa-v1/LSScats/v2/QSO_'+str(i)+'_full_HPmapcut.ran.fits'.replace('global','dvs_ro')
-#	ran = fitsio.read(ranf, columns=['RA', 'DEC','PHOTSYS'])
-#	common.printlog('read random, specified path, in loop '+str(i),logger)
-#	del ran
+#   ranf = '/global/cfs/cdirs/desi/survey/catalogs//DA2/LSS/loa-v1/LSScats/v2/QSO_'+str(i)+'_full_HPmapcut.ran.fits'.replace('global','dvs_ro')
+#   ran = fitsio.read(ranf, columns=['RA', 'DEC','PHOTSYS'])
+#   common.printlog('read random, specified path, in loop '+str(i),logger)
+#   del ran
 
 if args.imsys == 'y':
     common.printlog('doing linear regression',logger)
@@ -1309,22 +1363,32 @@ if args.ran_utlid == 'y':
 
 
 #needs to happen before randoms so randoms can get z and weights
-weightileloc=True
-if args.compmd == 'altmtl':
-    weightileloc = False
-if mkclusdat:
-    ct.mkclusdat(dirout+type+notqso,weightileloc,tp=type,dchi2=dchi2,zmin=mainp.zmin,zmax=mainp.zmax,correct_zcmb=args.zcmb,wsyscol=args.imsys_colname,use_map_veto=args.use_map_veto,extradir=args.extra_clus_dir)#,ntilecut=ntile,ccut=ccut)
-
 nzcompmd = 'ran'
 if args.compmd == 'altmtl':
     nzcompmd = args.compmd
+
+weightileloc=True
+redo_fracz=False
+if args.redo_fracz == 'y':
+    redo_fracz=True
+    common.printlog('recalculating FRACZ_TILELOCID weight from masked data',logger)
+NN = False
+if args.nearestneighbor == 'y':
+    NN = True
+    nzcompmd = 'dat'
+    common.printlog('adding nearest neighbor to completeness weight',logger)
+if args.compmd == 'altmtl':
+    weightileloc = False
+if mkclusdat:
+    ct.mkclusdat(dirout+type+notqso,redo_fracz=redo_fracz,NN=NN,weighttileloc=weightileloc,tp=type,dchi2=dchi2,zmin=mainp.zmin,zmax=mainp.zmax,correct_zcmb=args.zcmb,wsyscol=args.imsys_colname,use_map_veto=args.use_map_veto,extradir=args.extra_clus_dir)#,ntilecut=ntile,ccut=ccut)
+
 
 
 inds = np.arange(rm,rx)
 
 out_name = dirout +args.extra_clus_dir+ tracer_clus#type + notqso
 if args.zcmb == 'y':
-	out_name += '_zcmb'
+    out_name += '_zcmb'
 
 
 if mkclusran:
